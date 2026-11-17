@@ -27,7 +27,7 @@
     "defaults": {
       "remoteName": "gdrive",
       "folderPath": "~/Google Drive",
-      "browseMountPath": "~/GDrive-Browse",
+      "browseMountPath": "~/.local/share/omarchy-gdrive/browse",
       "syncIntervalMin": 10,
       "refreshIntervalSec": 30
     },
@@ -50,7 +50,7 @@
         "key": "browseMountPath",
         "type": "path",
         "label": "Browse mount folder",
-        "defaultValue": "~/GDrive-Browse",
+        "defaultValue": "~/.local/share/omarchy-gdrive/browse",
         "description": "Read-only on-demand FUSE view of the whole Drive, for reaching what is not synced."
       },
       {

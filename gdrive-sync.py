@@ -18,6 +18,7 @@ import codecs
 import ctypes
 import errno
 import fcntl
+import getpass
 import hashlib
 import itertools
 import json
@@ -33,7 +34,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+from urllib.parse import unquote, urlparse
 
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy-gdrive"
 SELECTION_PATH = STATE_DIR / "selection.json"
 FILTERS_PATH = STATE_DIR / "filters.txt"
@@ -43,13 +46,19 @@ LOG_PATH = STATE_DIR / "sync.log"
 MOUNT_LOG_PATH = STATE_DIR / "mount.log"
 WORKDIR = STATE_DIR / "workdir"
 LOCK_PATH = STATE_DIR / "sync.lock"
-UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "systemd" / "user"
+UNIT_DIR = CONFIG_DIR / "systemd" / "user"
+SHELL_CONFIG_PATH = CONFIG_DIR / "omarchy" / "shell.json"
+APPLICATIONS_DIR = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "applications"
+PLUGIN_ID = "io.github.hominluo.google-drive"
 
 SERVICE = "omarchy-gdrive-sync.service"
 BROWSE_SERVICE = "omarchy-gdrive-browse.service"
 TIMER = "omarchy-gdrive-sync.timer"
 
+DEFAULT_MOUNT = "~/.local/share/omarchy-gdrive/browse"
+
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 GLOB_SPECIALS = set("\\*?[]{}")
 SKIP_LOCAL = {".rclone-bisync", "lost+found"}
 CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -1297,7 +1306,7 @@ def status_payload(remote_value: str, folder_value: str, mount_value: str,
                    interval_min: int = 0) -> dict[str, Any]:
   remote = normalize_remote(remote_value)
   folder = normalize_path(folder_value, "~/Google Drive")
-  mount_path = normalize_path(mount_value, "~/GDrive-Browse")
+  mount_path = normalize_path(mount_value, DEFAULT_MOUNT)
   rclone = rclone_bin()
   selection = load_selection()
   state = load_state()
@@ -1623,7 +1632,7 @@ def units_from_args(args: argparse.Namespace) -> None:
   ensure_units(
     normalize_remote(args.remote),
     normalize_path(args.folder, "~/Google Drive"),
-    normalize_path(args.mount, "~/GDrive-Browse"),
+    normalize_path(args.mount, DEFAULT_MOUNT),
   )
 
 
@@ -1641,7 +1650,7 @@ def cmd_browse(args: argparse.Namespace) -> None:
   """Enable/disable the browse mount as a unit, so the choice survives a
   reboot instead of living only in this session's mount table."""
   units_from_args(args)
-  mount_path = normalize_path(args.mount, "~/GDrive-Browse")
+  mount_path = normalize_path(args.mount, DEFAULT_MOUNT)
   # `enable --now` is a no-op on a unit that is already active, and an active
   # unit whose mount daemon died is exactly what an unclean boot leaves. Cycle
   # it, so "on" really means mounted.
@@ -1681,6 +1690,404 @@ def cmd_sync(args: argparse.Namespace) -> None:
   print(json.dumps({"ok": True, "started": True}))
 
 
+# ---------------------------------------------------------------- suite opener
+
+SUITE_APPS: dict[str, dict[str, Any]] = {
+  "docs": {
+    "desktop": "omarchy-gdrive-docs.desktop",
+    "name": "Google Docs (Drive)",
+    "icon": "libreoffice-writer",
+    "url": "https://docs.google.com/document/d/{id}/edit",
+    "extensions": {".doc", ".docx", ".odt", ".rtf"},
+    "mimes": [
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.oasis.opendocument.text",
+      "application/rtf",
+      "text/rtf",
+    ],
+  },
+  "sheets": {
+    "desktop": "omarchy-gdrive-sheets.desktop",
+    "name": "Google Sheets (Drive)",
+    "icon": "libreoffice-calc",
+    "url": "https://docs.google.com/spreadsheets/d/{id}/edit",
+    "extensions": {".xls", ".xlsx", ".ods", ".csv", ".tsv"},
+    "mimes": [
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.oasis.opendocument.spreadsheet",
+    ],
+  },
+  "slides": {
+    "desktop": "omarchy-gdrive-slides.desktop",
+    "name": "Google Slides (Drive)",
+    "icon": "libreoffice-impress",
+    "url": "https://docs.google.com/presentation/d/{id}/edit",
+    "extensions": {".ppt", ".pptx", ".odp"},
+    "mimes": [
+      "application/vnd.ms-powerpoint",
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "application/vnd.oasis.opendocument.presentation",
+    ],
+  },
+}
+OPENED_REMOTE_ROOT = "Omarchy-Opened"
+
+
+def load_shell_settings() -> dict[str, str]:
+  """Read the bar widget's saved remote/folder/mount settings from shell.json."""
+  defaults = {
+    "remoteName": "gdrive",
+    "folderPath": "~/Google Drive",
+    "browseMountPath": DEFAULT_MOUNT,
+  }
+  data = read_json(SHELL_CONFIG_PATH, {})
+  if not isinstance(data, dict):
+    return defaults
+  layout = (data.get("bar") or {}).get("layout") if isinstance(data.get("bar"), dict) else None
+  if not isinstance(layout, dict):
+    return defaults
+  for section in ("left", "centerBegin", "center", "centerEnd", "right", "tray"):
+    entries = layout.get(section)
+    if not isinstance(entries, list):
+      continue
+    for entry in entries:
+      if isinstance(entry, dict) and entry.get("id") == PLUGIN_ID:
+        for key in defaults:
+          val = entry.get(key)
+          if isinstance(val, str) and val.strip():
+            defaults[key] = val.strip()
+        return defaults
+  return defaults
+
+
+def suite_app_for_path(path: Path) -> dict[str, Any]:
+  ext = path.suffix.lower()
+  for app in SUITE_APPS.values():
+    if ext in app["extensions"]:
+      return app
+  raise ValueError(f"Unsupported file type for Google Workspace: {path.suffix or path.name}")
+
+
+def resolve_open_target(raw_target: str) -> Path:
+  value = (raw_target or "").strip()
+  if not value:
+    raise ValueError("No file path provided")
+  if CONTROL.search(value):
+    raise ValueError("File path contains control characters")
+  if value.startswith("file://"):
+    parsed = urlparse(value)
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+      raise ValueError("Only local files can be opened")
+    value = unquote(parsed.path)
+  elif "://" in value:
+    raise ValueError("Only local files can be opened")
+  path = Path(os.path.expandvars(os.path.expanduser(value)))
+  if not path.is_absolute():
+    path = Path.cwd() / path
+  resolved = path.resolve()
+  if CONTROL.search(str(resolved)):
+    raise ValueError("File path contains control characters")
+  try:
+    info = os.stat(resolved)
+  except OSError as error:
+    raise RuntimeError(f"Cannot access file: {error.strerror or error}") from error
+  if not stat.S_ISREG(info.st_mode):
+    raise ValueError("Target is not a regular file")
+  return resolved
+
+
+def relative_within(target: Path, root: Path) -> Path | None:
+  for candidate in (root, root.resolve()):
+    try:
+      return target.relative_to(candidate)
+    except ValueError:
+      continue
+  return None
+
+
+def validate_drive_rel(rel: Path) -> str:
+  parts = rel.parts
+  if not parts:
+    raise ValueError("Target has no relative Drive path")
+  for part in parts:
+    if not valid_drive_name(part):
+      raise ValueError(f"File or folder name is not valid for Google Drive: {clean_text(part, 60)!r}")
+  return rel.as_posix()
+
+
+def remote_file_id(rclone: str, remote: str, rel_posix: str) -> str:
+  rel_path = Path(rel_posix)
+  parent = "" if str(rel_path.parent) == "." else rel_path.parent.as_posix()
+  filename = rel_path.name
+  target = f"{remote}:{parent}" if parent else f"{remote}:"
+  fallback_id = ""
+  try:
+    with Child([rclone, "lsjson", target, "--files-only", "--no-modtime"],
+               timeout=45, max_stdout=MAX_LIST_BYTES) as child:
+      try:
+        for row in iter_json_array(child.chunks()):
+          if not isinstance(row, dict) or row.get("Name") != filename:
+            continue
+          file_id = row.get("ID")
+          if not isinstance(file_id, str) or not DRIVE_ID_RE.fullmatch(file_id):
+            continue
+          mime = str(row.get("MimeType") or "")
+          if not mime.startswith("application/vnd.google-apps."):
+            return file_id
+          if not fallback_id:
+            fallback_id = file_id
+      except ListingUnreadable:
+        raise RuntimeError(clean_text(child.failure() or "rclone returned an unreadable listing"))
+      if child.returncode not in (0, None):
+        raise RuntimeError(clean_text(child.stderr_text() or "Could not query Google Drive file ID"))
+  except (ListingTooLarge, ChildTimeout, ChildOutputTooLarge, OSError) as error:
+    raise RuntimeError(clean_text(str(error))) from error
+  return fallback_id
+
+
+def notify_user(title: str, message: str, *, critical: bool = False) -> None:
+  sender = shutil.which("omarchy-notification-send")
+  if sender:
+    cmd = [sender]
+    if critical:
+      cmd += ["-u", "critical"]
+    cmd += [title, message]
+    run(cmd, timeout=5)
+    return
+  notify = shutil.which("notify-send")
+  if notify:
+    cmd = [notify]
+    if critical:
+      cmd += ["-u", "critical"]
+    cmd += [title, message]
+    run(cmd, timeout=5)
+
+
+def launch_suite_url(url: str) -> None:
+  for tool in ("omarchy-launch-webapp", "omarchy-launch-browser"):
+    binary = shutil.which(tool)
+    if not binary:
+      continue
+    try:
+      result = subprocess.run(
+        [binary, url],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+      )
+      if result.returncode == 0:
+        return
+    except (OSError, subprocess.TimeoutExpired):
+      continue
+  raise RuntimeError("Could not launch a browser to open the document")
+
+
+def open_in_suite(raw_target: str, *, remote_arg: str | None = None,
+                  folder_arg: str | None = None, mount_arg: str | None = None) -> str:
+  saved = load_shell_settings()
+  remote = normalize_remote(remote_arg or saved["remoteName"])
+  sync_folder = normalize_path(folder_arg or saved["folderPath"], "~/Google Drive")
+  browse_mount = normalize_path(mount_arg or saved["browseMountPath"], DEFAULT_MOUNT)
+
+  target = resolve_open_target(raw_target)
+  app = suite_app_for_path(target)
+
+  rclone = rclone_bin()
+  if not rclone:
+    raise RuntimeError("rclone is not installed; install rclone and configure Google Drive first")
+  remotes, error = configured_remotes(rclone)
+  if error:
+    raise RuntimeError(error)
+  if remote not in remotes:
+    raise RuntimeError(f"rclone remote '{remote}' is not configured")
+
+  in_browse = relative_within(target, browse_mount)
+  in_sync = relative_within(target, sync_folder)
+
+  if in_browse is not None:
+    rel_posix = validate_drive_rel(in_browse)
+    file_id = remote_file_id(rclone, remote, rel_posix)
+  elif in_sync is not None:
+    rel_posix = validate_drive_rel(in_sync)
+    code, out, err = run([rclone, "copyto", "--update", str(target), f"{remote}:{rel_posix}"], timeout=120)
+    if code != 0:
+      raise RuntimeError(clean_text(err or out or "Could not sync file to Google Drive"))
+    file_id = remote_file_id(rclone, remote, rel_posix)
+  else:
+    if not valid_drive_name(target.name):
+      raise ValueError(f"File name is not valid for Google Drive: {clean_text(target.name, 60)!r}")
+    digest = hashlib.sha256(str(target).encode("utf-8")).hexdigest()[:10]
+    rel_posix = f"{OPENED_REMOTE_ROOT}/{digest}/{target.name}"
+    code, out, err = run([rclone, "copyto", "--update", str(target), f"{remote}:{rel_posix}"], timeout=120)
+    if code != 0:
+      raise RuntimeError(clean_text(err or out or "Could not upload file to Google Drive"))
+    file_id = remote_file_id(rclone, remote, rel_posix)
+
+  if not file_id:
+    raise RuntimeError("Could not resolve the Google Drive document ID")
+
+  url = app["url"].format(id=file_id)
+  launch_suite_url(url)
+  return url
+
+
+def cmd_open_web(args: argparse.Namespace) -> int:
+  try:
+    url = open_in_suite(
+      args.file,
+      remote_arg=args.remote,
+      folder_arg=args.folder,
+      mount_arg=args.mount,
+    )
+    print(json.dumps({"ok": True, "url": url}))
+    return 0
+  except (OSError, RuntimeError, ValueError) as error:
+    message = clean_text(str(error))
+    notify_user("Google Drive", message, critical=True)
+    print(message, file=sys.stderr)
+    return 1
+
+
+def desktop_entry_text(app: dict[str, Any], exec_helper: Path) -> str:
+  python = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (shutil.which("python3") or "/usr/bin/python3")
+  quoted_helper = str(exec_helper).replace("\\", "\\\\").replace('"', '\\"')
+  mimes = ";".join(app["mimes"]) + ";"
+  return (
+    "[Desktop Entry]\n"
+    "Version=1.0\n"
+    "Type=Application\n"
+    f"Name={app['name']}\n"
+    f"Icon={app['icon']}\n"
+    f'Exec={python} "{quoted_helper}" open-web %u\n'
+    "Terminal=false\n"
+    "NoDisplay=true\n"
+    "StartupNotify=true\n"
+    f"MimeType={mimes}\n"
+  )
+
+
+def install_desktop_handlers(*, register_defaults: bool = True) -> list[str]:
+  # Prefer the stable ~/.config/omarchy/plugins/<id>/ symlink path when present.
+  plugin_helper = CONFIG_DIR / "omarchy" / "plugins" / PLUGIN_ID / "gdrive-sync.py"
+  exec_helper = plugin_helper if plugin_helper.exists() else Path(__file__).resolve()
+  installed: list[str] = []
+  for app in SUITE_APPS.values():
+    path = APPLICATIONS_DIR / app["desktop"]
+    write_atomic(path, desktop_entry_text(app, exec_helper), mode=0o644)
+    installed.append(str(path))
+    if register_defaults:
+      xdg_mime = shutil.which("xdg-mime")
+      if xdg_mime:
+        for mime in app["mimes"]:
+          run([xdg_mime, "default", app["desktop"], mime], timeout=10)
+  if register_defaults:
+    updater = shutil.which("update-desktop-database")
+    if updater:
+      run([updater, str(APPLICATIONS_DIR)], timeout=15)
+  return installed
+
+
+def _is_portuguese() -> bool:
+  lang_file = Path(os.environ.get("OMARCHY_LANGUAGE_FILE") or (CONFIG_DIR / "omarchy" / "language"))
+  try:
+    code = lang_file.read_text(encoding="utf-8").strip().lower()
+  except OSError:
+    code = (os.environ.get("LANG") or "").lower()
+  return code.startswith("pt")
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+  """Guided interactive setup for end users: connects Google Drive with rclone,
+  registers Folio file handlers, and refreshes the bar widget."""
+  pt = _is_portuguese()
+  remote = normalize_remote(args.remote)
+  rclone = rclone_bin()
+
+  def pause() -> None:
+    try:
+      input("\nPressione Enter para fechar..." if pt else "\nPress Enter to close...")
+    except EOFError:
+      pass
+
+  print(f"=== Google Drive ({remote}:) ===\n")
+  if not rclone:
+    print("rclone não está instalado. Instale com: omarchy pkg add rclone fuse3" if pt
+          else "rclone is not installed. Install with: omarchy pkg add rclone fuse3")
+    pause()
+    return 1
+
+  remotes, err = configured_remotes(rclone)
+  if not err and remote in remotes:
+    print(f"O remoto '{remote}:' já existe." if pt else f"Remote '{remote}:' already exists.")
+    try:
+      ans = input("Deseja reconfigurar a conexão? [s/N]: " if pt else "Reconfigure connection? [y/N]: ").strip().lower()
+    except EOFError:
+      ans = ""
+    if ans not in ("s", "sim", "y", "yes"):
+      install_desktop_handlers()
+      shell = shutil.which("omarchy-shell")
+      if shell:
+        run([shell, PLUGIN_ID, "refresh"], timeout=10)
+      print("Pronto! Integração atualizada." if pt else "Done! Integration refreshed.")
+      pause()
+      return 0
+
+  if pt:
+    print("Um navegador será aberto para você entrar na sua conta Google.")
+    print("Client ID/Secret próprios são opcionais (pressione Enter para login rápido).\n")
+  else:
+    print("A browser window will open so you can sign in to your Google account.")
+    print("A custom OAuth Client ID/Secret is optional (press Enter for quick login).\n")
+
+  try:
+    client_id = input("Google OAuth Client ID (opcional / Enter para pular): " if pt
+                      else "Google OAuth Client ID (optional / Enter to skip): ").strip()
+  except EOFError:
+    client_id = ""
+  if CONTROL.search(client_id):
+    raise ValueError("Client ID contains control characters")
+
+  client_secret = ""
+  if client_id:
+    try:
+      client_secret = getpass.getpass("Google OAuth Client Secret: ").strip()
+    except EOFError:
+      client_secret = ""
+    if CONTROL.search(client_secret):
+      raise ValueError("Client Secret contains control characters")
+
+  cmd = [rclone, "config", "create", remote, "drive", "scope=drive"]
+  if client_id:
+    cmd.append(f"client_id={client_id}")
+  if client_secret:
+    cmd.append(f"client_secret={client_secret}")
+
+  print("\nAbrindo autenticação no navegador..." if pt else "\nOpening browser authentication...")
+  result = subprocess.run(cmd)
+  if result.returncode != 0:
+    print("\nFalha na configuração do rclone." if pt else "\nrclone setup failed.")
+    pause()
+    return result.returncode or 1
+
+  _, _, _, warning = storage_usage(rclone, remote)
+  if warning:
+    print(f"\nAviso ao verificar conta: {warning}" if pt else f"\nAccount check warning: {warning}")
+  else:
+    print("\nConta Google Drive conectada com sucesso!" if pt else "\nGoogle Drive connected successfully!")
+
+  install_desktop_handlers()
+  shell = shutil.which("omarchy-shell")
+  if shell:
+    run([shell, PLUGIN_ID, "refresh"], timeout=10)
+  print("Atalhos do Folio configurados e painel atualizado." if pt
+        else "Folio file handlers configured and panel refreshed.")
+  pause()
+  return 0
+
+
 def parser() -> argparse.ArgumentParser:
   result = argparse.ArgumentParser(description=__doc__)
   commands = result.add_subparsers(dest="command", required=True)
@@ -1688,7 +2095,7 @@ def parser() -> argparse.ArgumentParser:
   status = commands.add_parser("status")
   status.add_argument("--remote", default="gdrive")
   status.add_argument("--folder", default="~/Google Drive")
-  status.add_argument("--mount", default="~/GDrive-Browse")
+  status.add_argument("--mount", default=DEFAULT_MOUNT)
   # The widget sends its configured cadence so a changed value reaches the
   # timer drop-in; 0 means "no opinion".
   status.add_argument("--interval", type=int, default=0)
@@ -1708,7 +2115,7 @@ def parser() -> argparse.ArgumentParser:
   sync.add_argument("--resync", action="store_true")
   sync.add_argument("--remote", default="gdrive")
   sync.add_argument("--folder", default="~/Google Drive")
-  sync.add_argument("--mount", default="~/GDrive-Browse")
+  sync.add_argument("--mount", default=DEFAULT_MOUNT)
 
   runner = commands.add_parser("run")
   runner.add_argument("--remote", default="gdrive")
@@ -1722,10 +2129,10 @@ def parser() -> argparse.ArgumentParser:
 
   mount = commands.add_parser("mount")
   mount.add_argument("--remote", default="gdrive")
-  mount.add_argument("--mount", default="~/GDrive-Browse")
+  mount.add_argument("--mount", default=DEFAULT_MOUNT)
 
   unmount = commands.add_parser("unmount")
-  unmount.add_argument("--mount", default="~/GDrive-Browse")
+  unmount.add_argument("--mount", default=DEFAULT_MOUNT)
 
   browse = commands.add_parser("browse")
   browse_group = browse.add_mutually_exclusive_group(required=True)
@@ -1733,7 +2140,7 @@ def parser() -> argparse.ArgumentParser:
   browse_group.add_argument("--disable", action="store_true")
   browse.add_argument("--remote", default="gdrive")
   browse.add_argument("--folder", default="~/Google Drive")
-  browse.add_argument("--mount", default="~/GDrive-Browse")
+  browse.add_argument("--mount", default=DEFAULT_MOUNT)
 
   timer = commands.add_parser("timer")
   group = timer.add_mutually_exclusive_group(required=True)
@@ -1742,7 +2149,19 @@ def parser() -> argparse.ArgumentParser:
   timer.add_argument("--interval", type=int, default=0)
   timer.add_argument("--remote", default="gdrive")
   timer.add_argument("--folder", default="~/Google Drive")
-  timer.add_argument("--mount", default="~/GDrive-Browse")
+  timer.add_argument("--mount", default=DEFAULT_MOUNT)
+
+  open_web = commands.add_parser("open-web")
+  open_web.add_argument("file")
+  open_web.add_argument("--remote", default=None)
+  open_web.add_argument("--folder", default=None)
+  open_web.add_argument("--mount", default=None)
+
+  install_handlers = commands.add_parser("install-handlers")
+  install_handlers.add_argument("--no-defaults", action="store_true")
+
+  setup_cmd = commands.add_parser("setup")
+  setup_cmd.add_argument("--remote", default="gdrive")
 
   return result
 
@@ -1772,13 +2191,20 @@ def main() -> int:
     elif args.command == "cleanup":
       return cmd_cleanup(args)
     elif args.command == "mount":
-      mount_browse(normalize_remote(args.remote), normalize_path(args.mount, "~/GDrive-Browse"))
+      mount_browse(normalize_remote(args.remote), normalize_path(args.mount, DEFAULT_MOUNT))
     elif args.command == "unmount":
-      unmount_browse(normalize_path(args.mount, "~/GDrive-Browse"))
+      unmount_browse(normalize_path(args.mount, DEFAULT_MOUNT))
     elif args.command == "browse":
       cmd_browse(args)
     elif args.command == "timer":
       cmd_timer(args)
+    elif args.command == "open-web":
+      return cmd_open_web(args)
+    elif args.command == "install-handlers":
+      paths = install_desktop_handlers(register_defaults=not args.no_defaults)
+      print(json.dumps({"ok": True, "installed": paths}))
+    elif args.command == "setup":
+      return cmd_setup(args)
   except (OSError, RuntimeError, ValueError) as error:
     if args.command in ("status", "folders"):
       print(json.dumps(error_payload(args.command, clean_text(str(error)))))

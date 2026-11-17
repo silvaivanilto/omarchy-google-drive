@@ -60,19 +60,22 @@ a folder. Until a Drive remote exists it simply reports what's missing.
 | The backend | `python` |
 | Unmounting the browse view | `fuse3` |
 | Detecting mounts and dead endpoints | `util-linux` |
-| The **Open** buttons | `nautilus` |
+| The **Open** buttons | `folio` |
 | The bar widget, and a systemd **user** session | Omarchy with the Quickshell bar |
 
 Only `rclone` is strictly required. Without `fuse3` the browse mount is
-unavailable; without `nautilus` the Open buttons do nothing. Syncing needs
+unavailable; without `folio` the Open buttons do nothing. Syncing needs
 neither.
 
 To remove it, see [Uninstall](#uninstall).
 
 ## Connect Google Drive
 
-The plugin drives rclone but never configures it, so do this once. It never
-reads or writes your client ID, secret, or OAuth token — rclone owns all of it.
+The easiest way is right from the panel: click **Connect Google Drive** to launch
+the guided setup (`gdrive-sync.py setup`), which signs you in via browser (with
+an optional custom OAuth Client ID/Secret), verifies the remote, and registers
+the Folio Google Workspace file handlers. It never stores your OAuth token
+itself — `rclone` owns all credentials.
 
 ### 1. Make your own Google OAuth client
 
@@ -138,7 +141,7 @@ Left click opens it, right click refreshes.
 | `c` | Clean up folders and files you stopped syncing |
 | Escape | Close |
 
-**Browse all** mounts your whole Drive read-only at `~/GDrive-Browse` without
+**Browse all** mounts your whole Drive read-only at `~/.local/share/omarchy-gdrive/browse` without
 downloading it — for reaching something you never synced. Right-click it to open
 the folder instead of toggling it.
 
@@ -149,15 +152,19 @@ after `rclone check --one-way` proves every local file still exists in Drive; an
 entry that fails the check is left alone and reported. Nothing is deleted on an
 unverified path, and cleanup waits while a sync is running.
 
-Google-native files — Docs, Sheets, Slides — are skipped. They have no real file
-to store; open them in a browser.
+Google-native files — Docs, Sheets, Slides — are skipped during bisync. They
+have no real file to store; open them in a browser. Clicking local Office/ODF
+files (`.doc`, `.docx`, `.odt`, `.rtf`, `.xls`, `.xlsx`, `.ods`, `.ppt`,
+`.pptx`, `.odp`) in Folio opens them directly in Google Docs, Sheets, or Slides
+via `gdrive-sync.py open-web` (configured automatically by `setup` or
+`gdrive-sync.py install-handlers`).
 
 ## Settings
 
 ```bash
 omarchy bar set io.github.hominluo.google-drive remoteName gdrive
 omarchy bar set io.github.hominluo.google-drive folderPath "$HOME/Google Drive"
-omarchy bar set io.github.hominluo.google-drive browseMountPath "$HOME/GDrive-Browse"
+omarchy bar set io.github.hominluo.google-drive browseMountPath "$HOME/.local/share/omarchy-gdrive/browse"
 omarchy bar set io.github.hominluo.google-drive syncIntervalMin 10 --json
 ```
 
@@ -165,7 +172,7 @@ omarchy bar set io.github.hominluo.google-drive syncIntervalMin 10 --json
 |---|---:|---|
 | `remoteName` | `gdrive` | rclone remote name, no trailing colon |
 | `folderPath` | `~/Google Drive` | The real on-disk synced folder |
-| `browseMountPath` | `~/GDrive-Browse` | Read-only on-demand view of the whole Drive |
+| `browseMountPath` | `~/.local/share/omarchy-gdrive/browse` | Read-only on-demand view of the whole Drive |
 | `syncIntervalMin` | `10` | Written to a systemd timer drop-in |
 | `refreshIntervalSec` | `30` | How often the panel re-reads status |
 
@@ -277,6 +284,7 @@ systemctl --user disable --now omarchy-gdrive-sync.timer omarchy-gdrive-browse.s
 rm -f ~/.config/systemd/user/omarchy-gdrive-sync.{service,timer}
 rm -f ~/.config/systemd/user/omarchy-gdrive-browse.service
 rm -rf ~/.config/systemd/user/omarchy-gdrive-sync.timer.d
+rm -f ~/.local/share/applications/omarchy-gdrive-{docs,sheets,slides}.desktop
 systemctl --user daemon-reload
 omarchy plugin remove io.github.hominluo.google-drive
 ```
@@ -309,6 +317,7 @@ fake `rclone`, so nothing touches Drive).
 | `Service.qml` | process plumbing between the panel and the backend |
 | `GoogleDriveIcon.qml` | the Drive mark, drawn to Google's geometry in your theme |
 | `Model.js` | parsing and formatting helpers |
+| `i18n/` | live UI translations (`en`, `pt-BR`) via `Commons.Translations` |
 
 ## License
 

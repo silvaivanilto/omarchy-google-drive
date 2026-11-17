@@ -60,9 +60,43 @@ function parseFolders(raw) {
   return parsed
 }
 
-function formatBytes(bytes) {
+function tr(strings, key, fallback) {
+  return strings && typeof strings.t === "function" ? strings.t(key, fallback) : fallback
+}
+
+function trn(strings, key, count, fallback) {
+  return strings && typeof strings.tn === "function" ? strings.tn(key, count, fallback) : fallback
+}
+
+function fmtNum(formatNumber, value, decimals) {
+  if (typeof formatNumber === "function") return formatNumber(value, decimals)
+  return decimals === undefined ? String(value) : Number(value).toFixed(decimals)
+}
+
+var STATUS_KEYS = {
+  "Checking…": "status.checking",
+  "Not installed": "status.notInstalled",
+  "Configuration unavailable": "status.configUnavailable",
+  "Needs connection": "status.needsConnection",
+  "Folder is a mount": "status.folderIsMount",
+  "Syncing…": "status.syncing",
+  "Nothing selected": "status.nothingSelected",
+  "Waiting for network": "status.waitingNetwork",
+  "Sync failed": "status.syncFailed",
+  "Synced": "status.synced",
+  "Ready to sync": "status.ready",
+  "Unavailable": "status.unavailable"
+}
+
+function translateStatus(statusText, strings) {
+  var text = String(statusText || "")
+  var key = STATUS_KEYS[text]
+  return key ? tr(strings, key, text) : text
+}
+
+function formatBytes(bytes, formatNumber) {
   var value = Number(bytes || 0)
-  if (!isFinite(value) || value <= 0) return "0 B"
+  if (!isFinite(value) || value <= 0) return fmtNum(formatNumber, 0) + " B"
   var units = ["B", "KB", "MB", "GB", "TB", "PB"]
   var index = 0
   while (value >= 1000 && index < units.length - 1) {
@@ -70,50 +104,68 @@ function formatBytes(bytes) {
     index++
   }
   var decimals = value >= 100 || index === 0 ? 0 : (value >= 10 ? 1 : 2)
-  return value.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d)0$/, "$1") + " " + units[index]
+  var rounded = Number(value.toFixed(decimals))
+  return fmtNum(formatNumber, rounded) + " " + units[index]
 }
 
-function relativeTime(timestampSec, nowMs) {
+function relativeTime(timestampSec, nowMs, strings, formatNumber) {
   var ts = Number(timestampSec || 0)
-  if (!isFinite(ts) || ts <= 0) return "Never"
-  var now = nowMs === undefined ? Date.now() : Number(nowMs)
+  if (!isFinite(ts) || ts <= 0) return tr(strings, "time.never", "Never")
+  var now = nowMs === undefined || nowMs === null ? Date.now() : Number(nowMs)
   var diff = Math.max(0, Math.floor((now - ts * 1000) / 1000))
-  if (diff < 45) return "Just now"
+  if (diff < 45) return tr(strings, "time.justNow", "Just now")
   var minutes = Math.floor(diff / 60)
-  if (minutes < 60) return Math.max(1, minutes) + "m ago"
+  if (minutes < 60) {
+    var m = Math.max(1, minutes)
+    return tr(strings, "time.minutesAgo", "%1m ago").replace("%1", fmtNum(formatNumber, m))
+  }
   var hours = Math.floor(minutes / 60)
-  if (hours < 24) return hours + "h ago"
+  if (hours < 24) return tr(strings, "time.hoursAgo", "%1h ago").replace("%1", fmtNum(formatNumber, hours))
   var days = Math.floor(hours / 24)
-  if (days < 30) return days + "d ago"
+  if (days < 30) return tr(strings, "time.daysAgo", "%1d ago").replace("%1", fmtNum(formatNumber, days))
   var months = Math.floor(days / 30)
-  if (months < 12) return months + "mo ago"
-  return Math.floor(days / 365) + "y ago"
+  if (months < 12) return tr(strings, "time.monthsAgo", "%1mo ago").replace("%1", fmtNum(formatNumber, months))
+  return tr(strings, "time.yearsAgo", "%1y ago").replace("%1", fmtNum(formatNumber, Math.floor(days / 365)))
 }
 
-function usageText(usedBytes, quotaBytes, quotaKnown) {
+function usageText(usedBytes, quotaBytes, quotaKnown, strings, formatNumber) {
   if (quotaKnown && Number(quotaBytes || 0) > 0)
-    return formatBytes(usedBytes) + " of " + formatBytes(quotaBytes)
-  return formatBytes(usedBytes)
+    return tr(strings, "info.usageOf", "%1 of %2")
+      .replace("%1", formatBytes(usedBytes, formatNumber))
+      .replace("%2", formatBytes(quotaBytes, formatNumber))
+  return formatBytes(usedBytes, formatNumber)
 }
 
 // One line describing what the folder currently holds.
-function folderSummary(status) {
+function folderSummary(status, strings, formatNumber) {
   if (!status) return ""
   var count = Number(status.selectedCount || 0)
   var parts = []
-  parts.push(count === 0 ? "No folders" : (count === 1 ? "1 folder" : count + " folders"))
-  if (status.rootFiles) parts.push("root files")
-  parts.push((status.localBytesApprox ? "≈ " : "") + formatBytes(status.localBytes) + " on disk")
+  parts.push(
+    count === 0
+      ? tr(strings, "summary.noFolders", "No folders")
+      : trn(strings, "summary.folders", count, count === 1 ? "%1 folder" : "%1 folders")
+          .replace("%1", fmtNum(formatNumber, count))
+  )
+  if (status.rootFiles) parts.push(tr(strings, "summary.rootFiles", "root files"))
+  var sizeText = formatBytes(status.localBytes, formatNumber)
+  if (status.localBytesApprox) sizeText = tr(strings, "info.approxValue", "≈ %1").replace("%1", sizeText)
+  parts.push(tr(strings, "summary.onDisk", "%1 on disk").replace("%1", sizeText))
   return parts.join(" · ")
 }
 
-function folderMeta(folder) {
+function folderMeta(folder, strings, formatNumber) {
   if (!folder) return ""
-  var bytes = (folder.approx ? "≈ " : "") + formatBytes(folder.localBytes)
-  if (folder.missing) return "Not in Drive · " + bytes + " on disk"
-  if (folder.stale) return "No longer syncing · " + bytes
-  if (folder.selected) return folder.onDisk ? bytes + " on disk" : "Waiting for first sync"
-  return "Not synced"
+  var bytes = formatBytes(folder.localBytes, formatNumber)
+  if (folder.approx) bytes = tr(strings, "info.approxValue", "≈ %1").replace("%1", bytes)
+  if (folder.missing) return tr(strings, "folder.notInDrive", "Not in Drive · %1 on disk").replace("%1", bytes)
+  if (folder.stale) return tr(strings, "folder.noLongerSyncing", "No longer syncing · %1").replace("%1", bytes)
+  if (folder.selected) {
+    return folder.onDisk
+      ? tr(strings, "folder.onDisk", "%1 on disk").replace("%1", bytes)
+      : tr(strings, "folder.waitingFirstSync", "Waiting for first sync")
+  }
+  return tr(strings, "folder.notSynced", "Not synced")
 }
 
 function folderGlyph(folder) {
@@ -121,13 +173,22 @@ function folderGlyph(folder) {
 }
 
 // The loose files at the very top of Drive, which belong to no folder.
-function rootFilesMeta(count, bytes, localCount, localBytes) {
+function rootFilesMeta(count, bytes, localCount, localBytes, strings, formatNumber) {
   var n = Number(count || 0)
   var have = Number(localCount || 0)
   var onDisk = Number(localBytes || 0)
-  var kept = have > 0 ? " · " + formatBytes(onDisk) + " on disk" : ""
-  if (n <= 0) return have > 0 ? have + (have === 1 ? " file" : " files") + kept : "Files that sit in no folder"
-  return n + (n === 1 ? " file" : " files") + " · " + formatBytes(bytes) + kept
+  var kept = have > 0
+    ? " · " + tr(strings, "rootFiles.keptOnDisk", "%1 on disk").replace("%1", formatBytes(onDisk, formatNumber))
+    : ""
+  if (n <= 0) {
+    if (have > 0) {
+      return trn(strings, "rootFiles.count", have, have === 1 ? "%1 file" : "%1 files")
+        .replace("%1", fmtNum(formatNumber, have)) + kept
+    }
+    return tr(strings, "rootFiles.empty", "Files that sit in no folder")
+  }
+  return trn(strings, "rootFiles.count", n, n === 1 ? "%1 file" : "%1 files")
+    .replace("%1", fmtNum(formatNumber, n)) + " · " + formatBytes(bytes, formatNumber) + kept
 }
 
 function shortHomePath(path, home) {
@@ -143,6 +204,7 @@ if (typeof module !== "undefined") {
     defaultStatus: defaultStatus,
     parseStatus: parseStatus,
     parseFolders: parseFolders,
+    translateStatus: translateStatus,
     formatBytes: formatBytes,
     relativeTime: relativeTime,
     usageText: usageText,

@@ -984,3 +984,223 @@ class QmlWatchdogTests(unittest.TestCase):
 
   def test_the_control_watchdog_outlasts_a_bounded_cleanup(self):
     self.assertGreaterEqual(self.interval("controlWatchdog"), (mod.CLEANUP_TIMEOUT + 600) * 1000)
+
+
+class PluginGuideComplianceTests(unittest.TestCase):
+  """Regression checks for Omarchy plugin guide rules (UI safety, motion, i18n, Folio)."""
+
+  def test_service_uses_folio_instead_of_nautilus(self):
+    service_qml = (ROOT / "Service.qml").read_text(encoding="utf-8")
+    self.assertIn('"folio"', service_qml)
+    self.assertNotIn("nautilus", service_qml)
+
+  def test_animations_use_style_duration(self):
+    for qml in ROOT.glob("*.qml"):
+      text = qml.read_text(encoding="utf-8")
+      self.assertIsNone(
+        re.search(r"duration:\s*\d+", text),
+        f"{qml.name} must wrap animation duration in Style.duration(...)",
+      )
+    bar_qml = (ROOT / "BarWidget.qml").read_text(encoding="utf-8")
+    self.assertIn("!Style.reduceMotion", bar_qml)
+    self.assertNotIn("SequentialAnimation on opacity", bar_qml)
+
+  def test_every_panel_text_forces_plain_text_for_markup_safety(self):
+    panel_qml = (ROOT / "Panel.qml").read_text(encoding="utf-8")
+    # Every `Text { ... }` element must declare `textFormat: Text.PlainText`.
+    blocks = re.findall(r"\bText\s*\{([^}]*)\}", panel_qml, flags=re.S)
+    self.assertGreater(len(blocks), 0)
+    for block in blocks:
+      self.assertIn("textFormat: Text.PlainText", block)
+    # Markup-shaped folder names without '/' are valid on Drive and safe when rendered as PlainText.
+    self.assertTrue(mod.valid_drive_name("<b>markup"))
+    self.assertTrue(mod.valid_drive_name("<img src=x>"))
+
+  def test_i18n_catalogs_are_valid_and_complete(self):
+    en = mod.json.loads((ROOT / "i18n" / "en.json").read_text(encoding="utf-8"))
+    pt_br = mod.json.loads((ROOT / "i18n" / "pt-BR.json").read_text(encoding="utf-8"))
+    self.assertEqual(set(en.keys()), set(pt_br.keys()))
+    for key, val in en.items():
+      if isinstance(val, dict):
+        self.assertIn("one", val, key)
+        self.assertIn("other", val, key)
+        self.assertIsInstance(pt_br[key], dict, key)
+        self.assertIn("one", pt_br[key], key)
+        self.assertIn("other", pt_br[key], key)
+
+
+class OpenWebSuiteTests(TempDirCase):
+  def setUp(self):
+    super().setUp()
+    self.home = self.tmp / "home"
+    self.sync_dir = self.home / "Google Drive"
+    self.browse_dir = self.home / ".local" / "share" / "omarchy-gdrive" / "browse"
+    self.downloads = self.home / "Downloads"
+    for d in (self.sync_dir / "Work", self.browse_dir / "Shared", self.downloads):
+      d.mkdir(parents=True)
+    self.config_dir = self.tmp / "config"
+    self.apps_dir = self.tmp / "apps"
+    self.opened_urls = []
+    self.rclone_calls = []
+
+    def fake_run(command, *args, **kwargs):
+      self.rclone_calls.append(command)
+      if command[0] == "rclone" and command[1] == "listremotes":
+        return 0, "gdrive:\n", ""
+      if command[0] == "rclone" and command[1] == "copyto":
+        return 0, "", ""
+      return 0, "", ""
+
+    class FakeChild:
+      def __init__(self, command, **kwargs):
+        self.command = command
+        self.returncode = 0
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc):
+        return False
+
+      def chunks(self):
+        target = self.command[2]
+        if target.endswith("Work"):
+          name, fid = "report.docx", "1AbCdEfGhIjKlMnOpQrStUvWxYz"
+        elif target.endswith("Shared"):
+          name, fid = "deck.odp", "1SlidesId1234567890"
+        else:
+          name, fid = "local sheet.xlsx", "1SheetsId1234567890"
+        yield mod.json.dumps([{"Name": name, "ID": fid}]).encode("utf-8")
+
+    for patch in (
+      mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+      mock.patch.object(mod.Path, "home", return_value=self.home),
+      mock.patch.object(mod, "CONFIG_DIR", self.config_dir),
+      mock.patch.object(mod, "SHELL_CONFIG_PATH", self.config_dir / "omarchy" / "shell.json"),
+      mock.patch.object(mod, "APPLICATIONS_DIR", self.apps_dir),
+      mock.patch.object(mod, "rclone_bin", return_value="rclone"),
+      mock.patch.object(mod, "run", side_effect=fake_run),
+      mock.patch.object(mod, "Child", FakeChild),
+      mock.patch.object(mod, "launch_suite_url", side_effect=self.opened_urls.append),
+    ):
+      patch.start()
+      self.addCleanup(patch.stop)
+
+  def test_sync_folder_file_syncs_and_opens_docs_url(self):
+    doc = self.sync_dir / "Work" / "report.docx"
+    doc.write_text("docx")
+    url = mod.open_in_suite(str(doc))
+    self.assertEqual(url, "https://docs.google.com/document/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/edit")
+    self.assertEqual(self.opened_urls, [url])
+    copyto = [c for c in self.rclone_calls if c[:2] == ["rclone", "copyto"]]
+    self.assertEqual(copyto, [["rclone", "copyto", "--update", str(doc.resolve()), "gdrive:Work/report.docx"]])
+
+  def test_browse_mount_file_opens_slides_without_uploading(self):
+    deck = self.browse_dir / "Shared" / "deck.odp"
+    deck.write_text("odp")
+    url = mod.open_in_suite(str(deck))
+    self.assertEqual(url, "https://docs.google.com/presentation/d/1SlidesId1234567890/edit")
+    self.assertEqual([c for c in self.rclone_calls if c[:2] == ["rclone", "copyto"]], [])
+
+  def test_arbitrary_folder_file_and_file_uri_open_in_sheets(self):
+    sheet = self.downloads / "local sheet.xlsx"
+    sheet.write_text("xlsx")
+    uri = "file://" + str(sheet).replace(" ", "%20")
+    url = mod.open_in_suite(uri)
+    self.assertEqual(url, "https://docs.google.com/spreadsheets/d/1SheetsId1234567890/edit")
+    copyto = [c for c in self.rclone_calls if c[:2] == ["rclone", "copyto"]]
+    self.assertEqual(len(copyto), 1)
+    self.assertTrue(copyto[0][4].startswith(f"gdrive:{mod.OPENED_REMOTE_ROOT}/"))
+    self.assertTrue(copyto[0][4].endswith("/local sheet.xlsx"))
+
+  def test_unsupported_extension_is_refused(self):
+    txt = self.downloads / "notes.txt"
+    txt.write_text("hi")
+    with self.assertRaises(ValueError):
+      mod.open_in_suite(str(txt))
+
+  def test_install_desktop_handlers_writes_suite_entries(self):
+    paths = mod.install_desktop_handlers(register_defaults=False)
+    self.assertEqual(len(paths), 3)
+    docs_desktop = self.apps_dir / "omarchy-gdrive-docs.desktop"
+    content = docs_desktop.read_text(encoding="utf-8")
+    self.assertIn("open-web %u", content)
+    self.assertIn("application/vnd.oasis.opendocument.text;", content)
+    self.assertEqual(stat.S_IMODE(docs_desktop.stat().st_mode), 0o644)
+
+  def test_setup_runs_rclone_create_and_installs_handlers(self):
+    sub_calls = []
+
+    def fake_sub(cmd):
+      sub_calls.append(cmd)
+      return Namespace(returncode=0)
+
+    with mock.patch.object(mod, "configured_remotes", return_value=(set(), "")), \
+         mock.patch.object(mod, "storage_usage", return_value=(0, 100, True, "")), \
+         mock.patch.object(mod.subprocess, "run", side_effect=fake_sub), \
+         mock.patch.object(mod.shutil, "which", return_value=None), \
+         mock.patch("builtins.input", side_effect=["", ""]), \
+         contextlib.redirect_stdout(io.StringIO()):
+      code = mod.cmd_setup(Namespace(remote="gdrive"))
+    self.assertEqual(code, 0)
+    self.assertEqual(sub_calls, [["rclone", "config", "create", "gdrive", "drive", "scope=drive"]])
+    self.assertTrue((self.apps_dir / "omarchy-gdrive-docs.desktop").exists())
+
+  def test_remote_file_id_prefers_office_file_and_surfaces_lsjson_errors(self):
+    class DualChild:
+      def __init__(self, command, **kwargs):
+        self.returncode = 0
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc):
+        return False
+
+      def chunks(self):
+        yield mod.json.dumps([
+          {"Name": "doc.docx", "ID": "1GoogleDocId12345", "MimeType": "application/vnd.google-apps.document"},
+          {"Name": "doc.docx", "ID": "1OfficeDocId12345", "MimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        ]).encode("utf-8")
+
+    with mock.patch.object(mod, "Child", DualChild):
+      self.assertEqual(mod.remote_file_id("rclone", "gdrive", "doc.docx"), "1OfficeDocId12345")
+
+    class ErrorChild:
+      def __init__(self, command, **kwargs):
+        self.returncode = 3
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *exc):
+        return False
+
+      def chunks(self):
+        yield b"[]"
+
+      def stderr_text(self):
+        return "token expired"
+
+    with mock.patch.object(mod, "Child", ErrorChild):
+      with self.assertRaises(RuntimeError) as caught:
+        mod.remote_file_id("rclone", "gdrive", "doc.docx")
+    self.assertIn("token expired", str(caught.exception))
+
+
+class LaunchSuiteUrlTests(unittest.TestCase):
+  def test_launch_suite_url_falls_back_from_webapp_to_browser_with_devnull(self):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+      calls.append((cmd, kwargs.get("stdin"), kwargs.get("stdout"), kwargs.get("stderr")))
+      return Namespace(returncode=1 if "webapp" in cmd[0] else 0)
+
+    with mock.patch.object(mod.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), \
+         mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
+      mod.launch_suite_url("https://docs.google.com/document/d/1AbCdEfGh/edit")
+    self.assertEqual(len(calls), 2)
+    self.assertEqual(calls[0][0][0], "/usr/bin/omarchy-launch-webapp")
+    self.assertEqual(calls[1][0][0], "/usr/bin/omarchy-launch-browser")
+    for _, sin, sout, serr in calls:
+      self.assertEqual((sin, sout, serr), (mod.subprocess.DEVNULL, mod.subprocess.DEVNULL, mod.subprocess.DEVNULL))

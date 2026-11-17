@@ -1,11 +1,16 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Item {
   id: root
+
+  Commons.Translations {
+    id: strings
+    directory: Qt.resolvedUrl("i18n")
+  }
 
   property var settings: ({})
 
@@ -53,10 +58,12 @@ Item {
   readonly property string homePath: Quickshell.env("HOME") || ""
   readonly property string remoteName: String(setting("remoteName", "gdrive")).trim()
   readonly property string configuredFolder: expandHome(String(setting("folderPath", "~/Google Drive")))
-  readonly property string configuredMount: expandHome(String(setting("browseMountPath", "~/GDrive-Browse")))
+  readonly property string configuredMount: expandHome(String(setting("browseMountPath", "~/.local/share/omarchy-gdrive/browse")))
   readonly property int syncIntervalMin: intSetting("syncIntervalMin", 10, 1, 1440)
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 30, 10, 3600)
   readonly property bool busy: controlProcess.running
+  readonly property bool refreshing: statusProcess.running || foldersProcess.running
+  property bool setupLaunching: false
   readonly property bool browseActive: _desiredBrowse === -1 ? browseMounted : (_desiredBrowse === 1)
   readonly property bool autoSyncActive: _desiredTimer === -1 ? timerEnabled : (_desiredTimer === 1)
 
@@ -91,7 +98,7 @@ Item {
   }
 
   function baseArgs(command) {
-    return ["python3", helperPath, command]
+    return ["/usr/bin/python3", helperPath, command]
   }
 
   // sync/timer/browse write the systemd units, so they need the configured
@@ -136,7 +143,7 @@ Item {
       // unreadable state directory). Keep the last good connection state and
       // say what failed; a missing key is not "rclone is gone".
       statusOk = false
-      lastError = String(parsed.lastError || "Google Drive status is unavailable")
+      lastError = String(parsed.lastError || strings.t("service.statusUnavailable"))
       statusText = String(parsed.statusText || "Unavailable")
       if (parsed.installed === true) installed = true
       return
@@ -173,7 +180,7 @@ Item {
   function applyFolders(raw) {
     var parsed = Model.parseFolders(raw)
     if (parsed.ok === false) {
-      foldersError = parsed.lastError || "Could not list Google Drive folders"
+      foldersError = parsed.lastError || strings.t("service.foldersUnavailable")
       return
     }
     folders = parsed.folders
@@ -203,7 +210,7 @@ Item {
     copy[name] = next
     pendingFolders = copy
 
-    note(next ? "Adding " + name + "…" : "Removing " + name + " from sync…")
+    note((next ? strings.t("service.addingFolder") : strings.t("service.removingFolder")).arg(name))
     // `--add=NAME`: a folder called "-Something" must not read as an option.
     runControl(baseArgs("select").concat([(next ? "--add=" : "--remove=") + name]), function () {
       root.refreshFolders()
@@ -213,7 +220,7 @@ Item {
 
   function setRootFiles(enabled) {
     if (busy) return
-    note(enabled ? "Including root files…" : "Excluding root files…")
+    note(enabled ? strings.t("service.includingRoot") : strings.t("service.excludingRoot"))
     runControl(baseArgs("select").concat([enabled ? "--root-files" : "--no-root-files"]), function () {
       root.refreshFolders()
       root.refresh()
@@ -222,7 +229,7 @@ Item {
 
   function syncNow(resync) {
     if (busy || syncing) return
-    note("Starting sync…")
+    note(strings.t("service.startingSync"))
     var args = unitArgs("sync")
     if (resync === true) args.push("--resync")
     runControl(args, function () {
@@ -235,7 +242,7 @@ Item {
   function setAutoSync(enabled) {
     if (busy) return
     _desiredTimer = enabled ? 1 : 0
-    note(enabled ? "Enabling automatic sync…" : "Pausing automatic sync…")
+    note(enabled ? strings.t("service.enablingAuto") : strings.t("service.pausingAuto"))
     var args = unitArgs("timer").concat([enabled ? "--enable" : "--disable"])
     if (enabled) args = args.concat(["--interval", String(syncIntervalMin)])
     runControl(args, function () { root.refresh() })
@@ -245,14 +252,14 @@ Item {
     if (busy) return
     var turningOn = !browseActive
     _desiredBrowse = turningOn ? 1 : 0
-    note(turningOn ? "Mounting browse folder…" : "Unmounting browse folder…")
+    note(turningOn ? strings.t("service.mountingBrowse") : strings.t("service.unmountingBrowse"))
     runControl(unitArgs("browse").concat([turningOn ? "--enable" : "--disable"]),
                function () { root.refresh(); browseSettle.restart() })
   }
 
   function cleanupStale() {
     if (busy || (staleBytes <= 0 && staleCount <= 0)) return
-    note("Verifying against Drive before deleting…")
+    note(strings.t("service.verifyingCleanup"))
     runControl(baseArgs("cleanup").concat([
       "--remote", remoteName, "--folder", configuredFolder
     ]), function () {
@@ -262,20 +269,21 @@ Item {
   }
 
   function openFolder() {
-    if (folderPath !== "") Quickshell.execDetached(["uwsm-app", "--", "nautilus", fileUri(folderPath)])
+    if (folderPath !== "") Quickshell.execDetached(["uwsm-app", "--", "folio", String(folderPath)])
   }
 
   function openBrowse() {
     if (browseActive && mountPath !== "")
-      Quickshell.execDetached(["uwsm-app", "--", "nautilus", fileUri(mountPath)])
+      Quickshell.execDetached(["uwsm-app", "--", "folio", String(mountPath)])
     else
       Quickshell.execDetached(["omarchy-launch-browser", "https://drive.google.com/drive/my-drive"])
   }
 
-  function fileUri(path) {
-    var parts = String(path || "").split("/")
-    for (var i = 0; i < parts.length; i++) parts[i] = encodeURIComponent(parts[i])
-    return "file://" + parts.join("/")
+  function connectRemote() {
+    if (!installed || helperPath === "" || setupLaunching) return
+    setupLaunching = true
+    setupCooldownTimer.restart()
+    Quickshell.execDetached(["omarchy-launch-terminal", "/usr/bin/python3", helperPath, "setup", "--remote", remoteName])
   }
 
   function note(text) {
@@ -330,6 +338,13 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  Timer {
+    id: setupCooldownTimer
+    interval: 1500
+    repeat: false
+    onTriggered: root.setupLaunching = false
+  }
+
   // A command that exits 0 is not proof the mount is there: the optimistic
   // state is dropped a few seconds later so a mount that never came up shows
   // as off (and can be retried) instead of staying "Browsing" forever.
@@ -355,7 +370,7 @@ Item {
     onTriggered: {
       if (!statusProcess.running) return
       statusProcess.running = false
-      root.lastError = "Google Drive status check timed out"
+      root.lastError = strings.t("service.statusTimeout")
     }
   }
 
@@ -367,7 +382,7 @@ Item {
       if (!foldersProcess.running) return
       foldersProcess.running = false
       root.foldersLoading = false
-      root.foldersError = "Listing Google Drive folders timed out"
+      root.foldersError = strings.t("service.foldersTimeout")
     }
   }
 
@@ -380,7 +395,7 @@ Item {
       controlProcess.running = false
       root._desiredBrowse = -1
       root._desiredTimer = -1
-      root.lastError = "The Google Drive command timed out"
+      root.lastError = strings.t("service.commandTimeout")
       root.note(root.lastError)
     }
   }
@@ -394,7 +409,7 @@ Item {
     onExited: function (exitCode) {
       statusWatchdog.stop()
       if (exitCode === 0) root.applyStatus(String(statusStdout.text || ""))
-      else root.lastError = root.elide(String(statusStderr.text || "") || "Could not read Google Drive status")
+      else root.lastError = root.elide(String(statusStderr.text || "") || strings.t("service.statusError"))
     }
   }
 
@@ -408,7 +423,7 @@ Item {
       foldersWatchdog.stop()
       root.foldersLoading = false
       if (exitCode === 0) root.applyFolders(String(foldersStdout.text || ""))
-      else root.foldersError = root.elide(String(foldersStderr.text || "") || "Could not list Google Drive folders")
+      else root.foldersError = root.elide(String(foldersStderr.text || "") || strings.t("service.foldersUnavailable"))
     }
   }
 
@@ -425,7 +440,7 @@ Item {
         root._desiredBrowse = -1
         root._desiredTimer = -1
         root.pendingFolders = ({})
-        root.lastError = root.elide(stderrText || "The Google Drive command failed")
+        root.lastError = root.elide(stderrText || strings.t("service.commandFailed"))
         root.note(root.lastError)
       } else {
         root.lastError = ""

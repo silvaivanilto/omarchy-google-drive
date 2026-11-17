@@ -2,11 +2,18 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
+import "Model.js" as Model
 
 BarWidget {
   id: root
   moduleName: "io.github.hominluo.google-drive"
+
+  Commons.Translations {
+    id: strings
+    directory: Qt.resolvedUrl("i18n")
+  }
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item
@@ -68,24 +75,28 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    tooltipText: "Google Drive · " + root.driveStatus
+    tooltipText: strings.t("bar.tooltip").arg(Model.translateStatus(root.driveStatus, strings))
     iconComponent: Component {
       Item {
         GoogleDriveIcon {
           id: glyph
+          property real pulseOpacity: 1.0
           anchors.centerIn: parent
           iconSize: Style.space(12)
           color: root.iconColor
-          opacity: root.driveActive ? 1.0 : 0.6
+          opacity: (root.driveSyncing && !Style.reduceMotion)
+            ? pulseOpacity
+            : (root.driveActive ? 1.0 : 0.6)
 
           // A slow pulse while rclone is working, so a long first sync is
           // visible from the bar without opening the panel.
-          SequentialAnimation on opacity {
-            running: root.driveSyncing
+          SequentialAnimation on pulseOpacity {
+            running: root.driveSyncing && !Style.reduceMotion
             loops: Animation.Infinite
             alwaysRunToEnd: true
-            NumberAnimation { to: 0.35; duration: 900; easing.type: Easing.InOutQuad }
-            NumberAnimation { to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
+            onRunningChanged: if (!running) glyph.pulseOpacity = 1.0
+            NumberAnimation { to: 0.35; duration: Style.duration(900); easing.type: Easing.InOutQuad }
+            NumberAnimation { to: 1.0; duration: Style.duration(900); easing.type: Easing.InOutQuad }
           }
         }
       }

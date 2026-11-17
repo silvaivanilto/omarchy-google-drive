@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -10,6 +11,11 @@ Panel {
   id: root
   moduleName: "io.github.hominluo.google-drive"
   manageIpc: false
+
+  Commons.Translations {
+    id: strings
+    directory: Qt.resolvedUrl("i18n")
+  }
 
   property var anchorItem: null
   property var hostWidget: null
@@ -19,7 +25,7 @@ Panel {
 
   readonly property var barIdentity: hostWidget || root
   readonly property var folderRows: drive.folders
-  readonly property bool driveActive: drive.authenticated && drive.selectedCount > 0
+  readonly property bool driveActive: drive.authenticated && (drive.selectedCount > 0 || (drive.rootFiles && drive.syncBaseline))
   readonly property string driveStatus: drive.statusText
   readonly property bool driveSyncing: drive.syncing
 
@@ -30,13 +36,11 @@ Panel {
   readonly property color iconColor: drive.lastResult === "error"
     ? urgent
     : (drive.authenticated ? foreground : dim)
-  readonly property color barIconColor: drive.authenticated
-    ? (drive.lastResult === "error" ? urgent : barForeground)
-    : Qt.darker(barForeground, 1.55)
+  readonly property color barIconColor: drive.lastResult === "error" ? urgent : barForeground
   readonly property string displayFolder: Model.shortHomePath(drive.folderPath, Quickshell.env("HOME"))
   readonly property string lastSyncText: drive.syncing
-    ? "Syncing now"
-    : Model.relativeTime(drive.lastFinishedTs)
+    ? strings.t("info.syncingNow")
+    : Model.relativeTime(drive.lastFinishedTs, undefined, strings, Commons.I18n.formatNumber)
 
   function refresh() {
     drive.refresh()
@@ -76,7 +80,7 @@ Panel {
   function moveCursor(dx, dy) {
     cursorActive = true
     ensureCursor()
-    if (dy === 0) return
+    if (!drive.authenticated || dy === 0) return
     if (focusSection === "header") {
       if (dy > 0) focusSection = "root"
       return
@@ -104,6 +108,11 @@ Panel {
 
   function activateCursor() {
     ensureCursor()
+    if (!drive.authenticated) {
+      if (drive.installed) drive.connectRemote()
+      else root.refresh()
+      return
+    }
     if (focusSection === "header") drive.setAutoSync(!drive.autoSyncActive)
     else if (focusSection === "folders") drive.toggleFolder(selectedFolder())
     else if (focusSection === "root") drive.setRootFiles(!drive.rootFiles)
@@ -164,7 +173,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(400))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(620))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + Style.space(2), Style.space(620))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -178,11 +187,12 @@ Panel {
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (t) {
         var key = String(t || "").toLowerCase()
+        if (key === "r") { root.refresh(); return }
+        if (!drive.authenticated) return
         if (key === "s") drive.syncNow(false)
         else if (key === "a") drive.setAutoSync(!drive.autoSyncActive)
         else if (key === "b") drive.toggleBrowse()
         else if (key === "o") drive.openFolder()
-        else if (key === "r") root.refresh()
         else if (key === "c") drive.cleanupStale()
       }
 
@@ -190,8 +200,8 @@ Panel {
         id: panelFlick
         anchors.fill: parent
         contentWidth: width
-        contentHeight: column.implicitHeight
-        clip: true
+        contentHeight: column.implicitHeight + Style.space(2)
+        clip: interactive
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
@@ -199,7 +209,9 @@ Panel {
 
         Column {
           id: column
-          width: panelFlick.width
+          x: Style.space(2)
+          y: Style.space(1)
+          width: Math.max(0, panelFlick.width - Style.space(8))
           spacing: Style.space(12)
 
           Item {
@@ -211,15 +223,15 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: "Google Drive"
+              title: strings.t("app.name")
               meta: drive.authenticated
                 ? Model.folderSummary({
                     selectedCount: drive.selectedCount,
                     rootFiles: drive.rootFiles,
                     localBytes: drive.localBytes,
                     localBytesApprox: drive.localBytesApprox
-                  })
-                : "Not connected"
+                  }, strings, Commons.I18n.formatNumber)
+                : strings.t("hero.notConnected")
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: root.driveActive ? 1.0 : 0.5
@@ -245,8 +257,8 @@ Panel {
                   PanelToolTip {
                     visible: autoSwitch.containsMouse
                     text: drive.autoSyncActive
-                      ? "Automatic sync every " + drive.syncIntervalMin + " min — click to pause"
-                      : "Automatic sync paused — click to resume"
+                      ? strings.t("autoSync.onTooltip").arg(Commons.I18n.formatNumber(drive.syncIntervalMin))
+                      : strings.t("autoSync.offTooltip")
                     fontFamily: hero.fontFamily
                   }
                 }
@@ -278,13 +290,18 @@ Panel {
             width: parent.width
             spacing: Style.spacing.labelGap
 
-            InfoPair { label: "On disk"; value: (drive.localBytesApprox ? "≈ " : "") + Model.formatBytes(drive.localBytes) }
             InfoPair {
-              label: "In Drive"
-              value: Model.usageText(drive.usedBytes, drive.quotaBytes, drive.quotaKnown)
+              label: strings.t("info.onDisk")
+              value: drive.localBytesApprox
+                ? strings.t("info.approxValue").arg(Model.formatBytes(drive.localBytes, Commons.I18n.formatNumber))
+                : Model.formatBytes(drive.localBytes, Commons.I18n.formatNumber)
             }
-            InfoPair { label: "Folder"; value: root.displayFolder }
-            InfoPair { label: "Last sync"; value: root.lastSyncText }
+            InfoPair {
+              label: strings.t("info.inDrive")
+              value: Model.usageText(drive.usedBytes, drive.quotaBytes, drive.quotaKnown, strings, Commons.I18n.formatNumber)
+            }
+            InfoPair { label: strings.t("info.folder"); value: root.displayFolder }
+            InfoPair { label: strings.t("info.lastSync"); value: root.lastSyncText }
           }
 
           RowLayout {
@@ -293,47 +310,46 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              text: drive.syncing ? "Syncing…" : "Sync now"
+              text: drive.syncing ? strings.t("action.syncing") : strings.t("action.syncNow")
               iconText: "󰑐"
               iconSpinning: drive.syncing
               enabled: !drive.busy && !drive.syncing && drive.authenticated
+              opacity: enabled ? 1.0 : 0.5
               foreground: root.foreground
               fontFamily: root.fontFamily
-              tooltipText: "Run a two-way sync now  (s)"
+              tooltipText: strings.t("action.syncTooltip")
               bordered: true
               Layout.fillWidth: true
-              Layout.preferredWidth: 1
-              Layout.minimumWidth: 0
+              onHovered: function (on) { if (on) root.cursorActive = false }
               onClicked: drive.syncNow(false)
             }
 
             Button {
-              text: "Open"
+              text: strings.t("action.open")
               iconText: "󰉋"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              tooltipText: "Open the synced folder  (o)"
+              tooltipText: strings.t("action.openTooltip")
               bordered: true
               Layout.fillWidth: true
-              Layout.preferredWidth: 1
-              Layout.minimumWidth: 0
+              onHovered: function (on) { if (on) root.cursorActive = false }
               onClicked: drive.openFolder()
             }
 
             Button {
-              text: drive.browseActive ? "Browsing" : "Browse all"
+              text: drive.browseActive ? strings.t("action.browsing") : strings.t("action.browseAll")
               iconText: drive.browseActive ? "󰗠" : "󰇧"
               active: drive.browseActive
               enabled: !drive.busy
+              opacity: enabled ? 1.0 : 0.5
               foreground: root.foreground
               fontFamily: root.fontFamily
               tooltipText: drive.browseActive
-                ? "Unmount the whole-Drive view, and stop restoring it at login  (b)"
-                : "Mount the whole Drive read-only without downloading it, and restore it at login  (b)"
+                ? strings.t("action.browseOnTooltip")
+                : strings.t("action.browseOffTooltip")
               Layout.fillWidth: true
-              Layout.preferredWidth: 1
-              Layout.minimumWidth: 0
               bordered: true
+              onHovered: function (on) { if (on) root.cursorActive = false }
               onClicked: drive.toggleBrowse()
               onRightClicked: drive.openBrowse()
             }
@@ -350,7 +366,7 @@ Panel {
             spacing: Style.space(8)
 
             PanelSectionHeader {
-              text: "FOLDERS TO KEEP ON DISK"
+              text: strings.t("section.folders")
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -359,7 +375,7 @@ Panel {
               textFormat: Text.PlainText
               visible: drive.foldersLoading && root.folderRows.length === 0
               width: parent.width
-              text: "Reading your Drive folders…"
+              text: strings.t("folders.loading")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -400,7 +416,7 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
-                text: Model.formatBytes(drive.staleBytes) + " is still on disk for folders and files you stopped syncing."
+                text: strings.t("stale.notice").arg(Model.formatBytes(drive.staleBytes, Commons.I18n.formatNumber))
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -408,12 +424,15 @@ Panel {
               }
 
               Button {
-                text: "Clean up"
+                text: strings.t("action.cleanUp")
                 iconText: "󰩹"
                 enabled: !drive.busy
+                opacity: enabled ? 1.0 : 0.5
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                tooltipText: "Verify each file still exists in Drive, then delete the local copy  (c)"
+                tooltipText: strings.t("action.cleanUpTooltip")
+                bordered: true
+                onHovered: function (on) { if (on) root.cursorActive = false }
                 onClicked: drive.cleanupStale()
               }
             }
@@ -424,29 +443,72 @@ Panel {
   }
 
   component SetupNotice: Column {
-    spacing: Style.space(4)
+    spacing: Style.space(8)
 
-    Text {
-      textFormat: Text.PlainText
+    Column {
       width: parent.width
-      text: drive.installed
-        ? "Connect the " + drive.remoteName + ": remote"
-        : "rclone is required"
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
+      spacing: Style.space(4)
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        text: drive.installed
+          ? strings.t("setup.connectTitle").arg(drive.remoteName)
+          : strings.t("setup.rcloneRequiredTitle")
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        text: drive.installed
+          ? strings.t("setup.connectBody")
+          : strings.t("setup.rcloneRequiredBody")
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
     }
 
-    Text {
-      textFormat: Text.PlainText
+    RowLayout {
       width: parent.width
-      text: drive.installed
-        ? "Run rclone config to create a Google Drive remote named " + drive.remoteName + ", then refresh."
-        : "Install rclone and fuse3, then create a Google Drive remote."
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-      wrapMode: Text.WordWrap
+      spacing: Style.space(6)
+
+      Button {
+        visible: drive.installed
+        text: strings.t("setup.connectButton")
+        iconText: "󰌷"
+        enabled: drive.installed && !drive.setupLaunching
+        opacity: enabled ? 1.0 : 0.5
+        hasCursor: root.cursorActive && root.focusSection === "header"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        tooltipText: strings.t("setup.connectTooltip")
+        bordered: true
+        Layout.fillWidth: true
+        onHovered: function (on) {
+          if (on) { root.cursorActive = true; root.focusSection = "header" }
+        }
+        onClicked: drive.connectRemote()
+      }
+
+      Button {
+        text: strings.t("setup.refreshButton")
+        iconText: "󰑐"
+        iconSpinning: drive.refreshing
+        enabled: !drive.refreshing
+        opacity: enabled ? 1.0 : 0.5
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        tooltipText: strings.t("setup.refreshTooltip")
+        bordered: true
+        Layout.fillWidth: !drive.installed
+        onHovered: function (on) { if (on) root.cursorActive = false }
+        onClicked: root.refresh()
+      }
     }
   }
 
@@ -455,7 +517,7 @@ Panel {
     property var folder: null
     property int rowIndex: 0
     readonly property bool checked: drive.isSelected(folderRow.folder)
-    readonly property string folderName: folder ? String(folder.name || "Untitled") : "Untitled"
+    readonly property string folderName: folder ? String(folder.name || strings.t("folders.untitled")) : strings.t("folders.untitled")
 
     hasCursor: root.cursorActive && root.focusSection === "folders" && root.folderIndex === rowIndex
     foreground: root.foreground
@@ -515,7 +577,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: Model.folderMeta(folderRow.folder)
+          text: Model.folderMeta(folderRow.folder, strings, Commons.I18n.formatNumber)
           color: folderRow.folder && folderRow.folder.stale ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -575,7 +637,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           Layout.fillWidth: true
-          text: "Loose files at the top of Drive"
+          text: strings.t("rootFiles.title")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -586,7 +648,8 @@ Panel {
           textFormat: Text.PlainText
           Layout.fillWidth: true
           text: Model.rootFilesMeta(drive.rootFileCount, drive.rootFileBytes,
-                                    drive.rootLocalCount, drive.rootLocalBytes)
+                                    drive.rootLocalCount, drive.rootLocalBytes,
+                                    strings, Commons.I18n.formatNumber)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
